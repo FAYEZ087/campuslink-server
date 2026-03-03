@@ -10,8 +10,9 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-       origin: "*", // your Next.js frontend
+       origin: "https://campuslink-taupe.vercel.app", // your Next.js frontend
         methods: ["GET", "POST"],
+        credentials: true,
     },
 });
 
