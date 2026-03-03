@@ -12,7 +12,6 @@ const io = new Server(server, {
     cors: {
        origin: "https://campuslink-taupe.vercel.app", // your Next.js frontend
         methods: ["GET", "POST"],
-        credentials: true,
     },
 });
 
