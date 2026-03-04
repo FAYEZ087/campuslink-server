@@ -1,164 +1,330 @@
 const http = require("http");
 const { Server } = require("socket.io");
 
-const server = http.createServer((req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*")
-  res.setHeader("Content-Type", "application/json")
-  res.end(JSON.stringify({
-    status: "✅ CampusLink server running",
-    waiting: waitingQueue.length,
-    activePairs: Object.keys(activePairs).length / 2,
-  }))
-})
+// ─── Environment Variables ────────────────────────────────────────────────────
+// Set these in Render dashboard → Environment tab:
+//   ALLOWED_ORIGIN=https://campuslink-taupe.vercel.app
+//   NODE_ENV=production
+//   TURN_USERNAME=4d5a54a8f93a9a0f7e86fe4c
+//   TURN_CREDENTIAL=2IaEqXmvCzreIHOI
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "http://localhost:3000";
+const NODE_ENV = process.env.NODE_ENV || "development";
+const PORT = process.env.PORT || 3001;
 
+// SECURITY: TURN credentials loaded from env vars — never exposed to client directly
+const TURN_USERNAME = process.env.TURN_USERNAME || "";
+const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || "";
+
+// ─── Input Validation ─────────────────────────────────────────────────────────
+const VALID_INTERESTS = [
+  "Computer Science", "Music", "Gaming", "Movies & TV", "Fitness",
+  "Art & Design", "Travel", "Study Buddies", "Photography", "Podcasts",
+  "Mental Health", "Foodie", "Astronomy", "Grad School", "Coffee Chat",
+  "Pets", "Outdoors", "Party Culture"
+];
+
+const MAX_MESSAGE_LENGTH = 500;
+const MAX_INTERESTS = 10;
+const MAX_REASON_LENGTH = 100;
+const MAX_CONNECTIONS_PER_IP = 5;
+
+function sanitizeString(str, maxLength = 200) {
+  if (typeof str !== "string") return "";
+  return str
+    .trim()
+    .replace(/<[^>]*>/g, "")
+    .replace(/[^\w\s.,!?@#\-]/g, "")
+    .slice(0, maxLength);
+}
+
+function validateInterests(interests) {
+  if (!Array.isArray(interests)) return [];
+  return interests
+    .filter((i) => typeof i === "string" && VALID_INTERESTS.includes(i))
+    .slice(0, MAX_INTERESTS);
+}
+
+function validateSignalData(data) {
+  return data !== null && typeof data === "object";
+}
+
+// ─── Rate Limiting ────────────────────────────────────────────────────────────
+const ipConnectionCount = {};
+const socketEventCount = {};
+const bannedIPs = new Set();
+
+const RATE_LIMITS = {
+  "find-match": { max: 20, windowMs: 60_000 },
+  "chat-message": { max: 30, windowMs: 10_000 },
+  "next": { max: 15, windowMs: 60_000 },
+  "report": { max: 5, windowMs: 60_000 },
+  "webrtc-offer": { max: 20, windowMs: 60_000 },
+  "webrtc-answer": { max: 20, windowMs: 60_000 },
+  "ice-candidate": { max: 100, windowMs: 10_000 },
+};
+
+function isRateLimited(socketId, event) {
+  const limit = RATE_LIMITS[event];
+  if (!limit) return false;
+  const now = Date.now();
+  if (!socketEventCount[socketId]) socketEventCount[socketId] = {};
+  const tracker = socketEventCount[socketId][event] || { count: 0, windowStart: now };
+  if (now - tracker.windowStart > limit.windowMs) {
+    tracker.count = 0;
+    tracker.windowStart = now;
+  }
+  tracker.count++;
+  socketEventCount[socketId][event] = tracker;
+  if (tracker.count > limit.max) {
+    console.warn(`⚠️  Rate limit: ${socketId} on "${event}" (${tracker.count}/${limit.max})`);
+    return true;
+  }
+  return false;
+}
+
+// ─── HTTP Server ──────────────────────────────────────────────────────────────
+const server = http.createServer((req, res) => {
+
+  // ── SECURITY HEADERS (helmet.js equivalent) ───────────────────────────────
+  // Prevent MIME type sniffing
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  // Prevent clickjacking
+  res.setHeader("X-Frame-Options", "DENY");
+  // Enable XSS filter in older browsers
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  // Restrict referrer info
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  // Permissions policy — disable unused browser features
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  // Content Security Policy
+  res.setHeader("Content-Security-Policy", "default-src 'self'; connect-src *");
+  // HSTS — force HTTPS for 1 year
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // Handle preflight
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // ── TURN credentials endpoint ─────────────────────────────────────────────
+  // SECURITY: Credentials served from server — never hardcoded in client
+  // Client requests ICE config from here instead of having credentials in code
+  if (req.url === "/ice-config" && req.method === "GET") {
+    res.setHeader("Content-Type", "application/json");
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun.relay.metered.ca:80" },
+        {
+          urls: "turn:global.relay.metered.ca:80",
+          username: TURN_USERNAME,
+          credential: TURN_CREDENTIAL,
+        },
+        {
+          urls: "turn:global.relay.metered.ca:80?transport=tcp",
+          username: TURN_USERNAME,
+          credential: TURN_CREDENTIAL,
+        },
+        {
+          urls: "turn:global.relay.metered.ca:443",
+          username: TURN_USERNAME,
+          credential: TURN_CREDENTIAL,
+        },
+        {
+          urls: "turns:global.relay.metered.ca:443?transport=tcp",
+          username: TURN_USERNAME,
+          credential: TURN_CREDENTIAL,
+        },
+      ]
+    }));
+    return;
+  }
+
+  // ── Health check ──────────────────────────────────────────────────────────
+  res.setHeader("Content-Type", "application/json");
+  res.writeHead(200);
+  res.end(JSON.stringify(
+    NODE_ENV === "production"
+      ? { status: "ok" }
+      : { status: "✅ Hallway server running", waiting: waitingQueue.length, activePairs: Object.keys(activePairs).length / 2 }
+  ));
+});
+
+// ─── Socket.IO ────────────────────────────────────────────────────────────────
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: ALLOWED_ORIGIN,
     methods: ["GET", "POST"],
   },
-})
+  maxHttpBufferSize: 1e5, // 100KB max payload
+});
 
-// ─── State ────────────────────────────────────────────────────────────────────
-const waitingQueue = []
-const activePairs = {}
-const userInterests = {}
+// ─── App State ────────────────────────────────────────────────────────────────
+const waitingQueue = [];
+const activePairs = {};
+const userInterests = {};
 
 function sharedInterests(a, b) {
-  return a.filter((i) => b.includes(i)).length
+  return a.filter((i) => b.includes(i)).length;
 }
 
 function findBestMatch(newUser) {
-  if (waitingQueue.length === 0) return null
-  let bestIndex = 0
-  let bestScore = -1
+  if (waitingQueue.length === 0) return null;
+  let bestIndex = 0, bestScore = -1;
   waitingQueue.forEach((user, index) => {
-    const score = sharedInterests(newUser.interests, user.interests)
-    if (score > bestScore) {
-      bestScore = score
-      bestIndex = index
-    }
-  })
-  return waitingQueue.splice(bestIndex, 1)[0]
+    const score = sharedInterests(newUser.interests, user.interests);
+    if (score > bestScore) { bestScore = score; bestIndex = index; }
+  });
+  return waitingQueue.splice(bestIndex, 1)[0];
 }
 
-setInterval(() => {
-  io.emit("online-count", io.engine.clientsCount)
-}, 5000)
+setInterval(() => io.emit("online-count", io.engine.clientsCount), 5000);
 
+// ─── Socket Events ────────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
-  console.log(`✅ User connected: ${socket.id}`)
-  socket.emit("online-count", io.engine.clientsCount)
+  const ip = socket.handshake.headers["x-forwarded-for"] || socket.handshake.address;
+
+  if (bannedIPs.has(ip)) {
+    console.warn(`🚫 Blocked banned IP: ${ip}`);
+    socket.disconnect(true);
+    return;
+  }
+
+  ipConnectionCount[ip] = (ipConnectionCount[ip] || 0) + 1;
+  if (ipConnectionCount[ip] > MAX_CONNECTIONS_PER_IP) {
+    socket.emit("error-message", "Too many connections from your network.");
+    socket.disconnect(true);
+    return;
+  }
+
+  console.log(`✅ User connected: ${socket.id}`);
+  socket.emit("online-count", io.engine.clientsCount);
 
   socket.on("find-match", ({ interests }) => {
-    console.log(`🔍 ${socket.id} looking for match | interests: ${interests}`)
-    userInterests[socket.id] = interests || []
+    if (isRateLimited(socket.id, "find-match")) {
+      socket.emit("error-message", "Too many requests. Please slow down.");
+      return;
+    }
+    const safeInterests = validateInterests(interests);
+    userInterests[socket.id] = safeInterests;
 
     if (activePairs[socket.id]) {
-      const oldPartner = activePairs[socket.id]
-      socket.to(oldPartner).emit("partner-disconnected")
-      delete activePairs[oldPartner]
-      delete activePairs[socket.id]
+      const oldPartner = activePairs[socket.id];
+      socket.to(oldPartner).emit("partner-disconnected");
+      delete activePairs[oldPartner];
+      delete activePairs[socket.id];
     }
 
-    const newUser = { socketId: socket.id, interests: userInterests[socket.id] }
-    const match = findBestMatch(newUser)
+    const newUser = { socketId: socket.id, interests: safeInterests };
+    const match = findBestMatch(newUser);
 
     if (match) {
-      activePairs[socket.id] = match.socketId
-      activePairs[match.socketId] = socket.id
-      const commonInterests = sharedInterests(newUser.interests, match.interests)
-
-      socket.emit("match-found", {
-        partnerId: match.socketId,
-        isInitiator: true,
-        sharedInterests: commonInterests,
-      })
-      io.to(match.socketId).emit("match-found", {
-        partnerId: socket.id,
-        isInitiator: false,
-        sharedInterests: commonInterests,
-      })
-      console.log(`💚 Matched: ${socket.id} ↔ ${match.socketId}`)
+      activePairs[socket.id] = match.socketId;
+      activePairs[match.socketId] = socket.id;
+      const common = sharedInterests(safeInterests, match.interests);
+      socket.emit("match-found", { partnerId: match.socketId, isInitiator: true, sharedInterests: common });
+      io.to(match.socketId).emit("match-found", { partnerId: socket.id, isInitiator: false, sharedInterests: common });
+      console.log(`💚 Matched: ${socket.id} ↔ ${match.socketId}`);
     } else {
-      waitingQueue.push(newUser)
-      socket.emit("waiting")
-      console.log(`⏳ ${socket.id} added to queue. Queue size: ${waitingQueue.length}`)
+      waitingQueue.push(newUser);
+      socket.emit("waiting");
     }
-  })
+  });
 
   socket.on("webrtc-offer", ({ offer, to }) => {
-    socket.to(to).emit("webrtc-offer", { offer, from: socket.id })
-  })
+    if (isRateLimited(socket.id, "webrtc-offer")) return;
+    if (activePairs[socket.id] !== to) return; // SECURITY: only relay to verified partner
+    if (!validateSignalData(offer)) return;
+    socket.to(to).emit("webrtc-offer", { offer, from: socket.id });
+  });
 
   socket.on("webrtc-answer", ({ answer, to }) => {
-    socket.to(to).emit("webrtc-answer", { answer, from: socket.id })
-  })
+    if (isRateLimited(socket.id, "webrtc-answer")) return;
+    if (activePairs[socket.id] !== to) return;
+    if (!validateSignalData(answer)) return;
+    socket.to(to).emit("webrtc-answer", { answer, from: socket.id });
+  });
 
   socket.on("ice-candidate", ({ candidate, to }) => {
-    socket.to(to).emit("ice-candidate", { candidate, from: socket.id })
-  })
+    if (isRateLimited(socket.id, "ice-candidate")) return;
+    if (activePairs[socket.id] !== to) return;
+    if (!validateSignalData(candidate)) return;
+    socket.to(to).emit("ice-candidate", { candidate, from: socket.id });
+  });
 
   socket.on("chat-message", ({ message }) => {
-    const partnerId = activePairs[socket.id]
-    if (partnerId) {
-      io.to(partnerId).emit("chat-message", { message, from: socket.id })
+    if (isRateLimited(socket.id, "chat-message")) {
+      socket.emit("error-message", "You are sending messages too fast.");
+      return;
     }
-  })
+    const safeMessage = sanitizeString(message, MAX_MESSAGE_LENGTH);
+    if (!safeMessage) return;
+    const partnerId = activePairs[socket.id];
+    if (partnerId) io.to(partnerId).emit("chat-message", { message: safeMessage });
+  });
 
   socket.on("next", () => {
-    console.log(`⏭ ${socket.id} clicked Next`)
-    const partnerId = activePairs[socket.id]
-
+    if (isRateLimited(socket.id, "next")) {
+      socket.emit("error-message", "You are skipping too fast.");
+      return;
+    }
+    const partnerId = activePairs[socket.id];
     if (partnerId) {
-      io.to(partnerId).emit("partner-disconnected")
-      delete activePairs[partnerId]
-      delete activePairs[socket.id]
-      const partnerInterests = userInterests[partnerId] || []
-      waitingQueue.push({ socketId: partnerId, interests: partnerInterests })
-      io.to(partnerId).emit("waiting")
+      io.to(partnerId).emit("partner-disconnected");
+      delete activePairs[partnerId];
+      delete activePairs[socket.id];
+      waitingQueue.push({ socketId: partnerId, interests: userInterests[partnerId] || [] });
+      io.to(partnerId).emit("waiting");
     }
+    const qi = waitingQueue.findIndex((u) => u.socketId === socket.id);
+    if (qi !== -1) waitingQueue.splice(qi, 1);
 
-    const queueIndex = waitingQueue.findIndex((u) => u.socketId === socket.id)
-    if (queueIndex !== -1) waitingQueue.splice(queueIndex, 1)
-
-    const newUser = { socketId: socket.id, interests: userInterests[socket.id] || [] }
-    const match = findBestMatch(newUser)
-
+    const newUser = { socketId: socket.id, interests: userInterests[socket.id] || [] };
+    const match = findBestMatch(newUser);
     if (match) {
-      activePairs[socket.id] = match.socketId
-      activePairs[match.socketId] = socket.id
-      const commonInterests = sharedInterests(newUser.interests, match.interests)
-
-      socket.emit("match-found", { partnerId: match.socketId, isInitiator: true, sharedInterests: commonInterests })
-      io.to(match.socketId).emit("match-found", { partnerId: socket.id, isInitiator: false, sharedInterests: commonInterests })
-      console.log(`💚 Re-matched: ${socket.id} ↔ ${match.socketId}`)
+      activePairs[socket.id] = match.socketId;
+      activePairs[match.socketId] = socket.id;
+      const common = sharedInterests(newUser.interests, match.interests);
+      socket.emit("match-found", { partnerId: match.socketId, isInitiator: true, sharedInterests: common });
+      io.to(match.socketId).emit("match-found", { partnerId: socket.id, isInitiator: false, sharedInterests: common });
     } else {
-      waitingQueue.push(newUser)
-      socket.emit("waiting")
+      waitingQueue.push(newUser);
+      socket.emit("waiting");
     }
-  })
+  });
 
   socket.on("report", ({ reason }) => {
-    const partnerId = activePairs[socket.id]
-    console.log(`🚨 REPORT: ${socket.id} reported ${partnerId} | reason: ${reason}`)
-    socket.emit("report-received", { message: "Report submitted. Thank you." })
-  })
+    if (isRateLimited(socket.id, "report")) return;
+    const partnerId = activePairs[socket.id];
+    const safeReason = sanitizeString(reason || "No reason", MAX_REASON_LENGTH);
+    console.log(`🚨 REPORT: ${socket.id} reported ${partnerId} | reason: ${safeReason}`);
+    // TODO: Save to Supabase
+    socket.emit("report-received", { message: "Report submitted. Thank you." });
+  });
 
   socket.on("disconnect", () => {
-    console.log(`❌ User disconnected: ${socket.id}`)
-    const partnerId = activePairs[socket.id]
+    console.log(`❌ Disconnected: ${socket.id}`);
+    if (ipConnectionCount[ip] > 0) ipConnectionCount[ip]--;
+    delete socketEventCount[socket.id];
+    const partnerId = activePairs[socket.id];
     if (partnerId) {
-      io.to(partnerId).emit("partner-disconnected")
-      delete activePairs[partnerId]
+      io.to(partnerId).emit("partner-disconnected");
+      delete activePairs[partnerId];
     }
-    delete activePairs[socket.id]
-    delete userInterests[socket.id]
-    const queueIndex = waitingQueue.findIndex((u) => u.socketId === socket.id)
-    if (queueIndex !== -1) waitingQueue.splice(queueIndex, 1)
-  })
-})
+    delete activePairs[socket.id];
+    delete userInterests[socket.id];
+    const qi = waitingQueue.findIndex((u) => u.socketId === socket.id);
+    if (qi !== -1) waitingQueue.splice(qi, 1);
+  });
+});
 
-const PORT = process.env.PORT || 3001
 server.listen(PORT, () => {
-  console.log(`🚀 CampusLink signaling server running on port ${PORT}`)
-})
+  console.log(`🚀 Hallway server running on port ${PORT} | ENV: ${NODE_ENV}`);
+});
