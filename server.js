@@ -3,15 +3,19 @@ const { Server } = require("socket.io");
 
 // ─── Environment Variables ────────────────────────────────────────────────────
 // Set these in Render dashboard → Environment tab:
-//   ALLOWED_ORIGIN=https://campuslink-taupe.vercel.app
+//   ALLOWED_ORIGIN=https://hallwaychat.online,https://campuslink-taupe.vercel.app
 //   NODE_ENV=production
 //   TURN_USERNAME=4d5a54a8f93a9a0f7e86fe4c
 //   TURN_CREDENTIAL=2IaEqXmvCzreIHOI
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "http://localhost:3000";
+
+// SECURITY: Support multiple allowed origins via comma-separated env var
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGIN
+  ? process.env.ALLOWED_ORIGIN.split(",").map(o => o.trim())
+  : ["http://localhost:3000"];
+
 const NODE_ENV = process.env.NODE_ENV || "development";
 const PORT = process.env.PORT || 3001;
 
-// SECURITY: TURN credentials loaded from env vars — never exposed to client directly
 const TURN_USERNAME = process.env.TURN_USERNAME || "";
 const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || "";
 
@@ -84,37 +88,29 @@ function isRateLimited(socketId, event) {
 
 // ─── HTTP Server ──────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
+  // SECURITY: Dynamic CORS — allow any of the whitelisted origins
+  const requestOrigin = req.headers.origin;
+  const allowedOrigin = ALLOWED_ORIGINS.includes(requestOrigin)
+    ? requestOrigin
+    : ALLOWED_ORIGINS[0];
 
-  // ── SECURITY HEADERS (helmet.js equivalent) ───────────────────────────────
-  // Prevent MIME type sniffing
   res.setHeader("X-Content-Type-Options", "nosniff");
-  // Prevent clickjacking
   res.setHeader("X-Frame-Options", "DENY");
-  // Enable XSS filter in older browsers
   res.setHeader("X-XSS-Protection", "1; mode=block");
-  // Restrict referrer info
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-  // Permissions policy — disable unused browser features
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-  // Content Security Policy
   res.setHeader("Content-Security-Policy", "default-src 'self'; connect-src *");
-  // HSTS — force HTTPS for 1 year
   res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
-  // CORS
-  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // Handle preflight
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
     return;
   }
 
-  // ── TURN credentials endpoint ─────────────────────────────────────────────
-  // SECURITY: Credentials served from server — never hardcoded in client
-  // Client requests ICE config from here instead of having credentials in code
   if (req.url === "/ice-config" && req.method === "GET") {
     res.setHeader("Content-Type", "application/json");
     res.writeHead(200);
@@ -122,32 +118,15 @@ const server = http.createServer((req, res) => {
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun.relay.metered.ca:80" },
-        {
-          urls: "turn:global.relay.metered.ca:80",
-          username: TURN_USERNAME,
-          credential: TURN_CREDENTIAL,
-        },
-        {
-          urls: "turn:global.relay.metered.ca:80?transport=tcp",
-          username: TURN_USERNAME,
-          credential: TURN_CREDENTIAL,
-        },
-        {
-          urls: "turn:global.relay.metered.ca:443",
-          username: TURN_USERNAME,
-          credential: TURN_CREDENTIAL,
-        },
-        {
-          urls: "turns:global.relay.metered.ca:443?transport=tcp",
-          username: TURN_USERNAME,
-          credential: TURN_CREDENTIAL,
-        },
+        { urls: "turn:global.relay.metered.ca:80", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+        { urls: "turn:global.relay.metered.ca:80?transport=tcp", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+        { urls: "turn:global.relay.metered.ca:443", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+        { urls: "turns:global.relay.metered.ca:443?transport=tcp", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
       ]
     }));
     return;
   }
 
-  // ── Health check ──────────────────────────────────────────────────────────
   res.setHeader("Content-Type", "application/json");
   res.writeHead(200);
   res.end(JSON.stringify(
@@ -160,10 +139,11 @@ const server = http.createServer((req, res) => {
 // ─── Socket.IO ────────────────────────────────────────────────────────────────
 const io = new Server(server, {
   cors: {
-    origin: ALLOWED_ORIGIN,
+    // SECURITY: Accept all whitelisted origins
+    origin: ALLOWED_ORIGINS,
     methods: ["GET", "POST"],
   },
-  maxHttpBufferSize: 1e5, // 100KB max payload
+  maxHttpBufferSize: 1e5,
 });
 
 // ─── App State ────────────────────────────────────────────────────────────────
@@ -240,7 +220,7 @@ io.on("connection", (socket) => {
 
   socket.on("webrtc-offer", ({ offer, to }) => {
     if (isRateLimited(socket.id, "webrtc-offer")) return;
-    if (activePairs[socket.id] !== to) return; // SECURITY: only relay to verified partner
+    if (activePairs[socket.id] !== to) return;
     if (!validateSignalData(offer)) return;
     socket.to(to).emit("webrtc-offer", { offer, from: socket.id });
   });
@@ -305,7 +285,6 @@ io.on("connection", (socket) => {
     const partnerId = activePairs[socket.id];
     const safeReason = sanitizeString(reason || "No reason", MAX_REASON_LENGTH);
     console.log(`🚨 REPORT: ${socket.id} reported ${partnerId} | reason: ${safeReason}`);
-    // TODO: Save to Supabase
     socket.emit("report-received", { message: "Report submitted. Thank you." });
   });
 
@@ -327,4 +306,5 @@ io.on("connection", (socket) => {
 
 server.listen(PORT, () => {
   console.log(`🚀 Hallway server running on port ${PORT} | ENV: ${NODE_ENV}`);
+  console.log(`🌐 Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
 });
