@@ -127,6 +127,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Public stats endpoint for landing page
+  if (req.url === "/stats" && req.method === "GET") {
+    res.setHeader("Content-Type", "application/json");
+    res.writeHead(200);
+    res.end(JSON.stringify(getPublicStats()));
+    return;
+  }
+
   res.setHeader("Content-Type", "application/json");
   res.writeHead(200);
   res.end(JSON.stringify(
@@ -151,6 +159,33 @@ const waitingQueue = [];
 const activePairs = {};
 const userInterests = {};
 
+// ─── Stats Tracking (since server start) ──────────────────────────────────────
+const stats = {
+  totalConnections: 0,      // All-time connections since server start
+  totalMatches: 0,          // All-time matches since server start
+  matchesToday: 0,          // Matches today (resets at midnight UTC)
+  lastResetDate: new Date().toISOString().split("T")[0],
+};
+
+// Reset daily matches at midnight UTC
+function checkDailyReset() {
+  const today = new Date().toISOString().split("T")[0];
+  if (today !== stats.lastResetDate) {
+    stats.matchesToday = 0;
+    stats.lastResetDate = today;
+  }
+}
+
+function getPublicStats() {
+  checkDailyReset();
+  return {
+    onlineNow: io.engine.clientsCount,
+    totalConnections: stats.totalConnections,
+    totalMatches: stats.totalMatches,
+    matchesToday: stats.matchesToday,
+  };
+}
+
 function sharedInterests(a, b) {
   return a.filter((i) => b.includes(i)).length;
 }
@@ -165,7 +200,7 @@ function findBestMatch(newUser) {
   return waitingQueue.splice(bestIndex, 1)[0];
 }
 
-setInterval(() => io.emit("online-count", io.engine.clientsCount), 5000);
+setInterval(() => io.emit("live-stats", getPublicStats()), 5000);
 
 // ─── Socket Events ────────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
@@ -185,7 +220,8 @@ io.on("connection", (socket) => {
   }
 
   console.log(`✅ User connected: ${socket.id}`);
-  socket.emit("online-count", io.engine.clientsCount);
+  stats.totalConnections++;
+  socket.emit("live-stats", getPublicStats());
 
   socket.on("find-match", ({ interests }) => {
     if (isRateLimited(socket.id, "find-match")) {
@@ -208,6 +244,8 @@ io.on("connection", (socket) => {
     if (match) {
       activePairs[socket.id] = match.socketId;
       activePairs[match.socketId] = socket.id;
+      stats.totalMatches++;
+      stats.matchesToday++;
       const common = sharedInterests(safeInterests, match.interests);
       socket.emit("match-found", { partnerId: match.socketId, isInitiator: true, sharedInterests: common });
       io.to(match.socketId).emit("match-found", { partnerId: socket.id, isInitiator: false, sharedInterests: common });
@@ -271,6 +309,8 @@ io.on("connection", (socket) => {
     if (match) {
       activePairs[socket.id] = match.socketId;
       activePairs[match.socketId] = socket.id;
+      stats.totalMatches++;
+      stats.matchesToday++;
       const common = sharedInterests(newUser.interests, match.interests);
       socket.emit("match-found", { partnerId: match.socketId, isInitiator: true, sharedInterests: common });
       io.to(match.socketId).emit("match-found", { partnerId: socket.id, isInitiator: false, sharedInterests: common });
@@ -307,4 +347,31 @@ io.on("connection", (socket) => {
 server.listen(PORT, () => {
   console.log(`🚀 Hallway server running on port ${PORT} | ENV: ${NODE_ENV}`);
   console.log(`🌐 Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
+});
+
+// ─── Graceful Shutdown ────────────────────────────────────────────────────────
+process.on("SIGTERM", () => {
+  console.log("\n⏹️  SIGTERM signal received: closing HTTP server");
+  server.close(() => {
+    console.log("✅ HTTP server closed");
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error("❌ Forced shutdown - connections did not close gracefully");
+    process.exit(1);
+  }, 10000);
+});
+
+process.on("SIGINT", () => {
+  console.log("\n⏹️  SIGINT signal received: closing HTTP server");
+  server.close(() => {
+    console.log("✅ HTTP server closed");
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error("❌ Forced shutdown - connections did not close gracefully");
+    process.exit(1);
+  }, 10000);
 });
